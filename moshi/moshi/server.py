@@ -75,6 +75,15 @@ class ServerState:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
+        self.lm_gen.temp_text = float(request.query.get("text_temperature", 0.7))
+        self.lm_gen.top_k_text = int(request.query.get("text_topk", 25))
+        self.lm_gen.temp = float(request.query.get("audio_temperature", 0.8))
+        self.lm_gen.top_k = int(request.query.get("audio_topk", 250))
+
+        log("info", "starting a new chat session and update parameters")
+        log("info", f"Text temperature: {self.lm_gen.temp_text}, top-k: {self.lm_gen.top_k_text}")
+        log("info", f"Audio temperature: {self.lm_gen.temp}, top-k: {self.lm_gen.top_k}")
+
         async def recv_loop():
             nonlocal close
             try:
