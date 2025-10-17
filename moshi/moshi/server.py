@@ -327,6 +327,8 @@ def main():
             lm_kwargs_overrides=lm_kwargs_overrides
         )
         log("info", "pre-quantized moshi loaded")
+        # Move model to device to avoid device mismatch errors
+        lm = lm.to(args.device)
         
         # Use lm_gen_config from saved config if available
         lm_gen_config = saved_config.get("lm_gen_config", checkpoint_info.lm_gen_config)
