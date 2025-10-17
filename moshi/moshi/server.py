@@ -116,6 +116,12 @@ class ServerState:
         async def opus_loop():
             all_pcm_data = None
             skip_frames = 1
+            frame_count = 0
+            last_log_time = time.time()
+
+            total_mimi_encode_time = 0.0
+            total_lm_gen_time = 0.0
+            total_mimi_decode_time = 0.0
 
             while True:
                 if close:
@@ -129,12 +135,17 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
+                    
+                    # Time the mimi encode step
+                    t0 = time.time()
                     codes = self.mimi.encode(chunk)
+                    t1 = time.time()
+                    total_mimi_encode_time += (t1 - t0)
+                    
                     if skip_frames:
                         # The first input audio frame is ignored, as from the point of
                         # view of the model it is in the past. We still `mimi.encode` for simplicity,
@@ -143,11 +154,22 @@ class ServerState:
                         self.mimi.reset_streaming()
                         skip_frames -= 1
                     for c in range(codes.shape[-1]):
+                        # Time the lm_gen step
+                        t2 = time.time()
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        t3 = time.time()
+                        total_lm_gen_time += (t3 - t2)
+                        
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                        
+                        # Time the mimi decode step
+                        t4 = time.time()
                         main_pcm = self.mimi.decode(tokens[:, 1:])
+                        t5 = time.time()
+                        total_mimi_decode_time += (t5 - t4)
+                        
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
@@ -157,7 +179,23 @@ class ServerState:
                             msg = b"\x02" + bytes(_text, encoding="utf8")
                             log("info", f"text token '{_text}'")
                             await ws.send_bytes(msg)
-                    log("info", f"frame handled in {1000 * (time.time() - be):.1f}ms")
+
+                    # Process time for logging
+                    frame_count += 1
+                    current_time = time.time()
+                    if current_time - last_log_time >= 5.0:
+                        fps = frame_count / (current_time - last_log_time)
+                        avg_mimi_encode = (total_mimi_encode_time / frame_count) * 1000 if frame_count > 0 else 0
+                        avg_lm_gen = (total_lm_gen_time / frame_count) * 1000 if frame_count > 0 else 0
+                        avg_mimi_decode = (total_mimi_decode_time / frame_count) * 1000 if frame_count > 0 else 0
+                        log("info", f"FPS: {fps:.2f} ({frame_count} frames in {current_time - last_log_time:.1f}s) | "
+                                   f"Avg times - Mimi encode: {avg_mimi_encode:.2f}ms, LM gen: {avg_lm_gen:.2f}ms, "
+                                   f"Mimi decode: {avg_mimi_decode:.2f}ms")
+                        frame_count = 0
+                        last_log_time = current_time
+                        total_mimi_encode_time = 0.0
+                        total_lm_gen_time = 0.0
+                        total_mimi_decode_time = 0.0
 
         async def send_loop():
             while True:
