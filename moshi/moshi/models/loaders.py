@@ -413,6 +413,10 @@ def get_moshi_lm(
         dtype=dtype,
         **lm_kwargs)
 
+    # If loading a pre-quantized model, replace layers before loading weights
+    if load_quantized and quantize:
+        replace_linear_with_qlinear(model, bits=quantize_bits)
+
     if filename is not None:
         if _is_safetensors(filename):
             state = load_file(filename, device=str(device))

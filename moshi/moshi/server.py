@@ -306,21 +306,19 @@ def main():
         text_tokenizer = checkpoint_info.get_text_tokenizer()
         
         log("info", "loading pre-quantized moshi")
-        # For pre-quantized models, we need to:
-        # 1. Create the model with quantized layers (quantize=True)
-        # 2. But skip the actual quantization process (load_quantized=True)
-        # 3. Then load the already-quantized weights
+        # For pre-quantized models, we load them using the standard path
+        # but with load_quantized=True to skip the quantization step
         lm_kwargs_overrides = {
             "quantize": True,
             "quantize_bits": saved_config["quantize_bits"],
-            "load_quantized": True  # Signal to skip quantization
+            "load_quantized": True  # Signal to skip re-quantization
         }
         dtype = torch.float16 if saved_config.get("dtype") == "float16" else torch.bfloat16
         
-        # Get the model without loading weights (filename=None)
-        # This will create the model structure with quantized layers
+        # Use get_moshi_lm directly with the saved checkpoint
+        # The checkpoint is already in the right format (fsdp_best_state)
         lm = loaders.get_moshi_lm(
-            filename=None,
+            filename=saved_config["moshi_weight"],
             lm_kwargs=checkpoint_info.lm_config if checkpoint_info.lm_config else loaders._lm_kwargs,
             device=args.device,
             dtype=dtype,
@@ -328,15 +326,6 @@ def main():
             fuse_lora=False,
             lm_kwargs_overrides=lm_kwargs_overrides
         )
-        
-        # Now we need to replace linear layers with quantized ones before loading
-        from .utils.quantize import replace_linear_with_qlinear
-        replace_linear_with_qlinear(lm, bits=saved_config["quantize_bits"])
-        
-        # Load the quantized state dict
-        log("info", f"Loading quantized weights from {saved_config['moshi_weight']}")
-        state_dict = torch.load(saved_config["moshi_weight"], map_location=args.device)
-        lm.load_state_dict(state_dict)
         log("info", "pre-quantized moshi loaded")
         
         # Use lm_gen_config from saved config if available

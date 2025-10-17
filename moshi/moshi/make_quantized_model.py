@@ -112,10 +112,15 @@ def main():
     )
     log("info", "Moshi model loaded and quantized")
 
-    # Save the quantized model state dict
+    # Save the quantized model state dict in the format expected by get_moshi_lm
     moshi_path = output_dir / "moshi_quantized.pth"
     log("info", f"Saving quantized Moshi model to {moshi_path}")
-    torch.save(lm.state_dict(), moshi_path)
+    # Save in the checkpoint format expected by the loader
+    torch.save({
+        "fsdp_best_state": {
+            "model": lm.state_dict()
+        }
+    }, moshi_path)
     log("info", "Quantized Moshi model saved")
 
     # Copy or save Mimi model
