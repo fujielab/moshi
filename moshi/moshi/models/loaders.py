@@ -405,8 +405,6 @@ def get_moshi_lm(
     load_quantized = lm_kwargs.pop("load_quantized", False)
 
     init_device = device
-    if filename is not None:
-        init_device = torch.device('meta')
 
     model = LMModel(
         device=init_device,
