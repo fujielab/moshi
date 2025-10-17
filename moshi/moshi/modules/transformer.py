@@ -26,6 +26,49 @@ from .lora import LoRALinear
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 
+def _get_linear_weight(linear_module):
+    """Get weight tensor from a linear module (handles quantized layers)."""
+    if isinstance(linear_module, nn.Linear):
+        return linear_module.weight
+    elif isinstance(linear_module, (quantize.QLinear8bit, quantize.QLinear)):
+        return linear_module.weight
+    elif isinstance(linear_module, quantize.QLinear4bit):
+        # For 4-bit quantized layers, weights are stored quantized
+        # We need to dequantize them for operations that require full weights
+        quant_weight = linear_module.quant_weight
+        assert isinstance(quant_weight, torch.Tensor)
+        return linear_module.dequantize_4bit(quant_weight, linear_module.quant_state)
+    elif isinstance(linear_module, LoRALinear):
+        # LoRA has frozen_W which is the original linear layer
+        return linear_module.frozen_W.weight
+    else:
+        raise TypeError(f"Unsupported linear module type: {type(linear_module)}")
+
+
+def _linear_forward(linear_module, input_tensor, weight_slice=None):
+    """Forward pass through a linear module (handles quantized layers).
+    
+    Args:
+        linear_module: The linear module (can be nn.Linear or quantized)
+        input_tensor: Input tensor
+        weight_slice: Optional weight slice (for extracting Q/K/V from combined projection)
+    """
+    if weight_slice is not None:
+        # Need to perform partial linear operation with sliced weights
+        if isinstance(linear_module, nn.Linear):
+            return F.linear(input_tensor, weight_slice)
+        else:
+            # For quantized layers, we can't easily slice weights during inference
+            # Fall back to full projection and then slice the output
+            raise NotImplementedError(
+                "Weight slicing is not supported with quantized layers. "
+                "Cross-attention may not work with quantization."
+            )
+    else:
+        # Standard forward pass
+        return linear_module(input_tensor)
+
+
 class LayerNormF32(nn.LayerNorm):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         x_f32 = input.float()
@@ -440,11 +483,23 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         elif isinstance(in_proj, nn.Linear):
             device = in_proj.weight.device
             dtype = in_proj.weight.dtype
-        elif isinstance(in_proj, quantize.QLinear):
-            device = in_proj.weight.device
-            dtype = torch.float16
+        elif isinstance(in_proj, (quantize.QLinear, quantize.QLinear8bit, quantize.QLinear4bit)):
+            # Handle both 8-bit and 4-bit quantized layers
+            if isinstance(in_proj, quantize.QLinear4bit):
+                # For 4-bit, quant_weight is a buffer
+                quant_weight = in_proj.quant_weight
+                assert isinstance(quant_weight, torch.Tensor)
+                device = quant_weight.device
+                # 4-bit uses bfloat16 for computation (see QLinear4bit.compute_dtype)
+                dtype = torch.bfloat16
+            else:
+                device = in_proj.weight.device
+                # 8-bit uses float16
+                dtype = torch.float16
         else:
             raise RuntimeError(f"Unknown type {type(in_proj)} for linear.")
+        
+        assert isinstance(device, torch.device)
 
         dim_per_head = self.embed_dim // self.num_heads
         if self.cross_attention:
@@ -485,9 +540,20 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         assert key is value
         in_proj = self.in_projs[0]
         assert in_proj.bias is None
-        assert isinstance(in_proj, nn.Linear)
-        dim = in_proj.weight.shape[0] // 3
-        kv = nn.functional.linear(key, in_proj.weight[dim:])
+        
+        # Get weight tensor (supports quantized layers)
+        try:
+            weight = _get_linear_weight(in_proj)
+        except TypeError:
+            # Fallback for unsupported types
+            assert isinstance(in_proj, nn.Linear), (
+                f"Cross attention with quantized layers is not fully supported. "
+                f"Got {type(in_proj)}"
+            )
+            weight = in_proj.weight
+            
+        dim = weight.shape[0] // 3
+        kv = F.linear(key, weight[dim:])
         k, v = rearrange(kv, "b t (p h d) -> p b h t d", p=2, h=self.num_heads)
         return k, v
 
@@ -532,9 +598,20 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             assert len(self.in_projs) == 1
             in_proj = self.in_projs[0]
             assert in_proj.bias is None
-            assert isinstance(in_proj, nn.Linear)
-            dim = in_proj.weight.shape[0] // 3
-            q = nn.functional.linear(query, in_proj.weight[:dim])
+            
+            # Get weight tensor (supports quantized layers)
+            try:
+                weight = _get_linear_weight(in_proj)
+            except TypeError:
+                # Fallback for unsupported types
+                assert isinstance(in_proj, nn.Linear), (
+                    f"Cross attention with quantized layers is not fully supported. "
+                    f"Got {type(in_proj)}"
+                )
+                weight = in_proj.weight
+                
+            dim = weight.shape[0] // 3
+            q = F.linear(query, weight[:dim])
             q = rearrange(q, "b t (h d) -> b h t d", h=self.num_heads)
             k, v = self._get_cross_attention(key, value)
         else:
@@ -821,6 +898,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         betas: tp.Optional[tp.Tuple[float, float]] = None,
         layer_class: tp.Type[StreamingTransformerLayer] = StreamingTransformerLayer,
         quantize: bool = False,
+        quantize_bits: int = 8,
         checkpointing: bool = False,
         device=None,
         dtype=None,
@@ -833,6 +911,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         self.max_period = max_period
         self.positional_scale = positional_scale
         self.betas = betas
+        self.quantize_bits = quantize_bits
 
         assert positional_embedding in {"sin", "rope", "sin_rope", "none"}
         self.rope: tp.Optional[RotaryEmbedding] = None
@@ -856,10 +935,13 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
                     **kwargs,
                 )
             )
-            if quantize:
+            # Note: quantization is now applied after weights are loaded in loaders.py
+            # to avoid issues with meta device initialization during model creation.
+            # Keeping this for backward compatibility with models initialized without loaders.
+            if quantize and device != torch.device('meta'):
                 # Quantizing layers one by one to avoid taking too much space during init.
                 self.layers[-1].to(device=device, dtype=dtype)
-                replace_linear_with_qlinear(self.layers[-1])
+                replace_linear_with_qlinear(self.layers[-1], bits=self.quantize_bits)
 
     def _init_streaming_state(self, batch_size: int) -> _TransformerState:
         device = next(self.parameters()).device

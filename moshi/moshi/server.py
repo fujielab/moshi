@@ -251,6 +251,8 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument("-q", "--quantize", type=int, choices=[4,8], default=None,
+                        help="Quantize model weights to 4 or 8 bits. Default: no quantization.")
 
     args = parser.parse_args()
     seed_all(42424242)
@@ -281,7 +283,17 @@ def main():
     text_tokenizer = checkpoint_info.get_text_tokenizer()
 
     log("info", "loading moshi")
-    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora)
+    lm_kwargs_overrides = {}
+    if args.quantize is not None:
+        lm_kwargs_overrides["quantize"] = True
+        lm_kwargs_overrides["quantize_bits"] = args.quantize
+    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora,
+                                   lm_kwargs_overrides=lm_kwargs_overrides)
+    # lm = checkpoint_info.get_moshi(device=args.device, 
+    #                                dtype=args.dtype,
+    #                                fuse_lora=args.fuse_lora,
+    #                                lm_kwargs_overrides={"quantize": True,
+    #                                                     "quantize_bits": 8})
     log("info", "moshi loaded")
 
     state = ServerState(checkpoint_info.model_type, mimi, text_tokenizer, lm, args.cfg_coef, args.device,

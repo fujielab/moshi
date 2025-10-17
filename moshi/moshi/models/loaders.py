@@ -23,6 +23,7 @@ from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
 from ..modules.lora import replace_all_linear_with_lora, replace_lora_with_linear
+from ..utils.quantize import replace_linear_with_qlinear
 
 
 SAMPLE_RATE = 24000
@@ -422,6 +423,11 @@ def get_moshi_lm(
         else:
             pkg = torch.load(filename, "cpu",)
             model.load_state_dict(pkg["fsdp_best_state"]["model"], assign=True)
+
+    # Apply quantization after weights are loaded (to avoid meta device issues)
+    if lm_kwargs.get("quantize", False):
+        quantize_bits = lm_kwargs.get("quantize_bits", 8)
+        replace_linear_with_qlinear(model, bits=quantize_bits)
 
     if lora:
         assert not lm_kwargs.get("quantize"), (

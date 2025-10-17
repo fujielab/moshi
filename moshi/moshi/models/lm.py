@@ -104,6 +104,7 @@ class LMModel(StreamingContainer):
         condition_provider: tp.Optional[ConditionProvider] = None,
         fuser: tp.Optional[ConditionFuser] = None,
         quantize: bool = False,
+        quantize_bits: int = 8,
         device=None,
         dtype=None,
         gradient_checkpointing: bool = False,
@@ -150,6 +151,7 @@ class LMModel(StreamingContainer):
             device=device,
             dtype=dtype,
             quantize=quantize,
+            quantize_bits=quantize_bits,
             context=context,
             causal=causal,
             checkpointing=gradient_checkpointing,
@@ -202,6 +204,7 @@ class LMModel(StreamingContainer):
                 weights_per_step_schedule=depformer_weights_per_step_schedule,
                 causal=causal,
                 quantize=quantize,
+                quantize_bits=quantize_bits,
                 checkpointing=gradient_checkpointing,
                 device=device,
                 dtype=dtype,
@@ -233,8 +236,11 @@ class LMModel(StreamingContainer):
         if self.fuser is not None:
             self.fuser.to(device=device)
         self._init_weights()
-        if quantize:
-            replace_linear_with_qlinear(self)
+        # Note: quantization is applied after weights are loaded, not here in __init__.
+        # This is to avoid issues with meta device initialization.
+        # See loaders.py for the actual quantization call.
+        self._quantize = quantize
+        self._quantize_bits = quantize_bits
 
     @property
     def initial_token_id(self) -> int:
