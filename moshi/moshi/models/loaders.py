@@ -399,6 +399,11 @@ def get_moshi_lm(
     lora_rank = lm_kwargs.pop("lora_rank", 128)
     lora_scaling = lm_kwargs.pop("lora_scaling", 2.0)
 
+    # Quantization params (don't pass to LMModel)
+    quantize = lm_kwargs.pop("quantize", False)
+    quantize_bits = lm_kwargs.pop("quantize_bits", 8)
+    load_quantized = lm_kwargs.pop("load_quantized", False)
+
     init_device = device
     if filename is not None:
         init_device = torch.device('meta')
@@ -425,12 +430,12 @@ def get_moshi_lm(
             model.load_state_dict(pkg["fsdp_best_state"]["model"], assign=True)
 
     # Apply quantization after weights are loaded (to avoid meta device issues)
-    if lm_kwargs.get("quantize", False):
-        quantize_bits = lm_kwargs.get("quantize_bits", 8)
+    # Skip quantization if load_quantized is True (model is already quantized)
+    if quantize and not load_quantized:
         replace_linear_with_qlinear(model, bits=quantize_bits)
 
     if lora:
-        assert not lm_kwargs.get("quantize"), (
+        assert not quantize, (
             "LoRA and quantization are incompatible for now."
         )
         model = get_lora_moshi(

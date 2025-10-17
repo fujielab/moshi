@@ -229,6 +229,8 @@ def main():
     parser.add_argument("--gradio-tunnel-token",
                         help='Provide a custom (secret) token here to keep getting the same URL.')
 
+    parser.add_argument("--quantized-model-dir", type=str, 
+                        help="Path to a directory containing pre-quantized model created by make_quantized_model.py")
     parser.add_argument("--tokenizer", type=str, help="Path to a local tokenizer file.")
     parser.add_argument("--moshi-weight", type=str, help="Path to a local checkpoint file for Moshi.")
     parser.add_argument("--mimi-weight", type=str, help="Path to a local checkpoint file for Mimi.")
@@ -272,23 +274,93 @@ def main():
         else:
             tunnel_token = args.gradio_tunnel_token
 
-    log("info", "retrieving checkpoint")
-    checkpoint_info = loaders.CheckpointInfo.from_hf_repo(
-        args.hf_repo, args.moshi_weight, args.mimi_weight, args.tokenizer,
-        lora_weights=args.lora_weight, config_path=args.config_path)
-    log("info", "loading mimi")
-    mimi = checkpoint_info.get_mimi(device=args.device)
-    log("info", "mimi loaded")
+    # Load from pre-quantized model directory if specified
+    if args.quantized_model_dir is not None:
+        import json
+        quantized_dir = Path(args.quantized_model_dir)
+        config_file = quantized_dir / "config.json"
+        
+        if not config_file.exists():
+            log("error", f"Config file not found in {args.quantized_model_dir}")
+            sys.exit(1)
+        
+        log("info", f"Loading pre-quantized model from {args.quantized_model_dir}")
+        with open(config_file, "r") as f:
+            saved_config = json.load(f)
+        
+        # Override args with saved config
+        checkpoint_info = loaders.CheckpointInfo.from_hf_repo(
+            saved_config.get("original_hf_repo", loaders.DEFAULT_REPO),
+            saved_config["moshi_weight"],
+            saved_config["mimi_weight"],
+            saved_config["tokenizer"],
+            lora_weights=None,
+            config_path=None
+        )
+        
+        log("info", "loading mimi from pre-quantized checkpoint")
+        # get_mimi will automatically load the state_dict from the file
+        mimi = checkpoint_info.get_mimi(device=args.device)
+        log("info", "mimi loaded")
+        
+        text_tokenizer = checkpoint_info.get_text_tokenizer()
+        
+        log("info", "loading pre-quantized moshi")
+        # For pre-quantized models, we need to:
+        # 1. Create the model with quantized layers (quantize=True)
+        # 2. But skip the actual quantization process (load_quantized=True)
+        # 3. Then load the already-quantized weights
+        lm_kwargs_overrides = {
+            "quantize": True,
+            "quantize_bits": saved_config["quantize_bits"],
+            "load_quantized": True  # Signal to skip quantization
+        }
+        dtype = torch.float16 if saved_config.get("dtype") == "float16" else torch.bfloat16
+        
+        # Get the model without loading weights (filename=None)
+        # This will create the model structure with quantized layers
+        lm = loaders.get_moshi_lm(
+            filename=None,
+            lm_kwargs=checkpoint_info.lm_config if checkpoint_info.lm_config else loaders._lm_kwargs,
+            device=args.device,
+            dtype=dtype,
+            lora_weights=None,
+            fuse_lora=False,
+            lm_kwargs_overrides=lm_kwargs_overrides
+        )
+        
+        # Now we need to replace linear layers with quantized ones before loading
+        from .utils.quantize import replace_linear_with_qlinear
+        replace_linear_with_qlinear(lm, bits=saved_config["quantize_bits"])
+        
+        # Load the quantized state dict
+        log("info", f"Loading quantized weights from {saved_config['moshi_weight']}")
+        state_dict = torch.load(saved_config["moshi_weight"], map_location=args.device)
+        lm.load_state_dict(state_dict)
+        log("info", "pre-quantized moshi loaded")
+        
+        # Use lm_gen_config from saved config if available
+        lm_gen_config = saved_config.get("lm_gen_config", checkpoint_info.lm_gen_config)
+    else:
+        # Original loading path
+        log("info", "retrieving checkpoint")
+        checkpoint_info = loaders.CheckpointInfo.from_hf_repo(
+            args.hf_repo, args.moshi_weight, args.mimi_weight, args.tokenizer,
+            lora_weights=args.lora_weight, config_path=args.config_path)
+        log("info", "loading mimi")
+        mimi = checkpoint_info.get_mimi(device=args.device)
+        log("info", "mimi loaded")
 
-    text_tokenizer = checkpoint_info.get_text_tokenizer()
+        text_tokenizer = checkpoint_info.get_text_tokenizer()
 
-    log("info", "loading moshi")
-    lm_kwargs_overrides = {}
-    if args.quantize is not None:
-        lm_kwargs_overrides["quantize"] = True
-        lm_kwargs_overrides["quantize_bits"] = args.quantize
-    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora,
-                                   lm_kwargs_overrides=lm_kwargs_overrides)
+        log("info", "loading moshi")
+        lm_kwargs_overrides = {}
+        if args.quantize is not None:
+            lm_kwargs_overrides["quantize"] = True
+            lm_kwargs_overrides["quantize_bits"] = args.quantize
+        lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora,
+                                       lm_kwargs_overrides=lm_kwargs_overrides)
+        lm_gen_config = checkpoint_info.lm_gen_config
     # lm = checkpoint_info.get_moshi(device=args.device, 
     #                                dtype=args.dtype,
     #                                fuse_lora=args.fuse_lora,
@@ -297,7 +369,7 @@ def main():
     log("info", "moshi loaded")
 
     state = ServerState(checkpoint_info.model_type, mimi, text_tokenizer, lm, args.cfg_coef, args.device,
-                        **checkpoint_info.lm_gen_config)
+                        **lm_gen_config)
     log("info", "warming up the model")
     state.warmup()
     app = web.Application()
